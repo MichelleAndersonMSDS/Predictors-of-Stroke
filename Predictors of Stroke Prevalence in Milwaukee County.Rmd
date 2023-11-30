@@ -1,0 +1,695 @@
+---
+title: "Predictors of Stroke Prevalence in Milwaukee County"
+subtitle: "View R code at https://github.com/MichelleAndersonMSDS/Predictors-of-Stroke"
+author: "Michelle Anderson"
+date: "4/23/2023"
+output: pdf_document
+---
+
+```{r setup, echo=FALSE, include=FALSE}
+knitr::opts_chunk$set(
+  tidy=FALSE,     # display code as typed
+  size="small") 
+
+wd <- "/Users/michelleanderson/Documents/DS740 Machine Learning and Data Mining/Final Project/"
+```
+
+```{r libraries, echo=FALSE, include=FALSE}
+# Load libraries
+library(tidyverse)
+library(janitor)
+library(GGally)
+library(MASS)
+library(caret)
+library(glmnet)
+library(kableExtra)
+library(leaflet)
+library(sf)
+```
+
+```{r functions, echo=FALSE, include=FALSE}
+# 1. Function to count missing values by row
+count_na_func <- function(x) sum(is.na(x)) 
+
+# 2. Function to impute median for missing values by census tract
+median_impute <- function(dataset, variable) {
+  dataset = dataset
+  miss_val <- is.na(variable)
+  miss_tract <- is.na(dataset$TractFIPS)
+  tracts <- na.omit(unique(dataset$TractFIPS))
+  for (ii in 1:length(variable)) {
+    for (jj in 1:length(tracts)) {
+      tract_years = length(which(dataset$TractFIPS == tracts[jj]))
+      if (miss_val[ii] & tract_years > 1 & sum(is.na(which(dataset$TractFIPS == tracts[jj]))) < tract_years & dataset$TractFIPS[ii] == tracts[jj]) {
+        variable[ii] = median(variable[dataset$TractFIPS == tracts[jj]], na.rm=TRUE)
+      }
+      else if (miss_val[ii]) {
+        variable[ii] = median(variable, na.rm=TRUE)
+      }
+    }
+  }
+  return(variable)
+}
+
+# 3. Function to create GGpair plots
+ggpair_plot <- function(dataset, yvar, xvar_list, title) {
+  dataset <- na.omit(dataset)
+  dataset %>% dplyr::select(yvar, any_of(xvar_list)) %>% 
+    ggpairs(title=title, legend=1, aes(color=as.factor(dataset$Below_Median_HH_Inc), alpha=.6),
+        upper = list(continuous = wrap("cor", size = 2.5))) +
+    theme_minimal() +
+    theme(plot.title = element_text(size = 10), 
+        axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1, size=6), 
+        axis.text.y = element_text(size=6), 
+        axis.title.x=element_text(size=8),
+        axis.title.y=element_text(size=8),
+        strip.text.x = element_text(size = 6), 
+        strip.text.y = element_text(size = 5),
+        legend.title=element_text(size=8),
+        legend.text=element_text(size=6),
+        legend.position = "bottom") +
+    labs(fill = "Census tracts with household income below the median") +
+    scale_alpha_identity(guide="none") +
+    scale_fill_manual(values=c("#69b3a2", "#404080")) +
+    scale_color_manual(values=c("#69b3a2", "#404080")) 
+}
+
+# 4. Function to apply Box Cox transformations to predictor variables
+boxcox_apply <- function(data, list) {
+  for (ii in 1:ncol(data)) {
+    for (jj in 1:nrow(list)) {
+      if (colnames(data[ii]) == list$variable[jj]) {
+        if (list$recommended[jj] == 'sqrt(x)') {
+          data[ii] = sqrt(data[ii])
+        }
+        else if (list$recommended[jj] == 'log(x)') {
+          data[ii] = log(data[ii] + 1)
+        }
+        else if (list$recommended[jj] == '1/sqrt(x)') {
+          data[ii] = 1/sqrt(data[ii])
+        }
+        else {
+          data[ii] = data[ii]
+        }
+      }
+    }
+  }
+  return(data)
+}
+
+# 5. Function to perform principal components analysis
+pca_func <- function(data, name, groups) {
+  data <- data %>% dplyr::select(any_of(groups))
+  pca = prcomp(data, center=TRUE, scale=TRUE)
+  cumPVE <- summary(pca)$importance[3,]
+  PC_length = length(cumPVE[cumPVE < .8])+1
+  pc.scores = pca$x[,1:PC_length]
+  colnames(pc.scores) = paste0(name,'_', colnames(pc.scores))
+  return_list <- list(pca, pc.scores, cumPVE, PC_length)
+  return(return_list)
+}
+
+# 6. Function to plot loading values of principal components
+PCAloading_plot <- function(data, PC, threshold) {
+  data.frame(data) %>% 
+    ggplot(aes(x=reorder(rownames(data), -data[,PC]), y=data[,PC])) +  #
+    geom_bar(stat="identity", alpha=.5, 
+             fill=ifelse(abs(data[,PC])>threshold, "#69b3a2", "#404080"), 
+             color=ifelse(abs(data[,PC])>threshold, "#69b3a2", "#404080")) +
+    geom_abline(intercept=threshold, slope=0, linetype = "dashed") +
+    geom_abline(intercept=-threshold, slope=0, linetype = "dashed") +
+    geom_text(label=round(data[,PC],2), size=2.5, vjust=1.1) +
+    labs(y="PC loading", x="") +
+    ylim(min(data[,PC])-0.1, max(data[,PC])+0.1) +
+    theme_minimal() +
+    theme(plot.title = element_text(size = 10), 
+        axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1, size=6), 
+        axis.text.y = element_text(size=6), 
+        axis.title.x=element_text(size=8),
+        axis.title.y=element_text(size=8),
+        legend.title=element_text(size=8),
+        legend.text=element_text(size=6))
+}
+
+# 7. Function to calculate mean absolute error (MAE)
+mae_calc <- function(actual, predicted) {
+  n=length(ycompare)
+  sum=0
+  for (i in 1:n){
+    sum = abs(actual[i] - predicted[i]) + sum
+  }
+  error = sum/n
+return(error)
+}
+
+### Resource: https://www.r-bloggers.com/2016/01/strategies-to-speedup-r-code/
+```
+
+```{r load_data, eval=FALSE, include=FALSE}
+# Read in 500 Cities/PLACES data (It's the same data set, they just changed names)
+places_2016 <- read_csv(paste0(wd,"500_Cities__Census_Tract-level_Data__GIS_Friendly_Format___2016_release.csv"))
+places_2017 <- read_csv(paste0(wd,"500_Cities__Census_Tract-level_Data__GIS_Friendly_Format___2017_release.csv"))
+places_2018 <- read_csv(paste0(wd,"500_Cities__Census_Tract-level_Data__GIS_Friendly_Format___2018_release.csv"))
+places_2019 <- read_csv(paste0(wd,"500_Cities__Census_Tract-level_Data__GIS_Friendly_Format___2019_release.csv"))
+places_2020 <- read_csv(paste0(wd,"PLACES__Census_Tract_Data__GIS_Friendly_Format___2020_release.csv"))
+
+# Compare columns across data sets (scanning for differences)
+places_col_compare <- compare_df_cols(places_2016, places_2017, places_2018, places_2019, places_2020)
+
+# Unique PLACES TractFIPS
+PLACES_FIPS <- unique(places_2016$TractFIPS)
+
+# Filter to Milwaukee County and make columns compatible across data sets
+places_2016 <- places_2016 %>% filter(StateAbbr == "WI", PlaceName == "Milwaukee") %>% rename(population_count = Population2010)
+places_2017 <- places_2017 %>% filter(StateAbbr == "WI", PlaceName == "Milwaukee") 
+places_2018 <- places_2018 %>% filter(StateAbbr == "WI", PlaceName == "Milwaukee") %>% mutate(TractFIPS = as.character(TractFIPS)) %>% rename(population_count = Population2010)
+places_2019 <- places_2019 %>% filter(StateAbbr == "WI", PlaceName == "Milwaukee") %>% rename(population_count = Population2010) 
+places_2020 <- places_2020 %>% filter(StateAbbr == "WI", CountyName == "Milwaukee") %>% dplyr::select(-StateDesc) %>% mutate(Place_TractID = paste0(CountyFIPS,"-",TractFIPS)) %>% rename(population_count = TotalPopulation, PAPTEST_Crude95CI = CERVICAL_Crude95CI, PAPTEST_CrudePrev = CERVICAL_CrudePrev, PlaceFIPS = CountyFIPS, PlaceName = CountyName) %>% filter(TractFIPS %in% PLACES_FIPS)
+
+length(unique(places_2016$TractFIPS))
+length(unique(places_2017$TractFIPS))
+length(unique(places_2018$TractFIPS))
+length(unique(places_2019$TractFIPS))
+length(unique(places_2020$TractFIPS))
+
+# Read in Social Determinants of Health data
+SDOH_2016 <- readxl::read_xlsx(paste0(wd,"sdoh_2016_tract_1_0.xlsx"), sheet="Data")
+SDOH_2017 <- readxl::read_xlsx(paste0(wd,"sdoh_2017_tract_1_0.xlsx"), sheet="Data")
+SDOH_2018 <- readxl::read_xlsx(paste0(wd,"sdoh_2018_tract_1_0.xlsx"), sheet="Data")
+SDOH_2019 <- readxl::read_xlsx(paste0(wd,"sdoh_2019_tract_1_0.xlsx"), sheet="Data")
+SDOH_2020 <- readxl::read_xlsx(paste0(wd,"sdoh_2020_tract_1_0.xlsx"), sheet="Data")
+
+# Compare columns across data sets (scanning for differences)
+SDOH_col_compare <- compare_df_cols(SDOH_2016, SDOH_2017, SDOH_2018, SDOH_2019, SDOH_2020)
+SDOH_col_compare$var_row_sum <- rowSums(is.na(SDOH_col_compare[2:6]))
+SDOH_drop_list <- SDOH_col_compare %>% filter(var_row_sum > 0)
+
+# Filter to Milwaukee County and drop columns that do not exist across all data sets
+SDOH_2016 <- SDOH_2016 %>% filter(STATE == "Wisconsin", COUNTY == "Milwaukee County") %>%
+  dplyr::select(-one_of(SDOH_drop_list$column_name[!is.na(SDOH_drop_list$SDOH_2016)]))
+SDOH_2017 <- SDOH_2017 %>% filter(STATE == "Wisconsin", COUNTY == "Milwaukee County") %>% 
+  dplyr::select(-one_of(SDOH_drop_list$column_name[!is.na(SDOH_drop_list$SDOH_2017)])) 
+SDOH_2018 <- SDOH_2018 %>% filter(STATE == "Wisconsin", COUNTY == "Milwaukee County") %>% 
+  dplyr::select(-one_of(SDOH_drop_list$column_name[!is.na(SDOH_drop_list$SDOH_2018)]))
+SDOH_2019 <- SDOH_2019 %>% filter(STATE == "Wisconsin", COUNTY == "Milwaukee County") %>% 
+  dplyr::select(-one_of(SDOH_drop_list$column_name[!is.na(SDOH_drop_list$SDOH_2019)]))
+SDOH_2020 <- SDOH_2020 %>% filter(STATE == "Wisconsin", COUNTY == "Milwaukee County") %>% 
+  dplyr::select(-one_of(SDOH_drop_list$column_name[!is.na(SDOH_drop_list$SDOH_2020)]))
+
+# Join each year of data
+disease_2016 <- left_join(places_2016, SDOH_2016, by = c('TractFIPS'='TRACTFIPS')) %>% mutate(Year = 2016)
+disease_2017 <- left_join(places_2017, SDOH_2017, by = c('TractFIPS'='TRACTFIPS')) %>% mutate(Year = 2017)
+disease_2018 <- left_join(places_2018, SDOH_2018, by = c('TractFIPS'='TRACTFIPS')) %>% mutate(Year = 2018)
+disease_2019 <- left_join(places_2019, SDOH_2019, by = c('TractFIPS'='TRACTFIPS')) %>% mutate(Year = 2019)
+disease_2020 <- left_join(places_2020, SDOH_2020, by = c('TractFIPS'='TRACTFIPS')) %>% mutate(Year = 2020)
+
+# Combine all years of data
+disease_all <- rbind(disease_2016, disease_2017)
+disease_all <- rbind(disease_all, disease_2018)
+disease_all <- rbind(disease_all, disease_2019)
+disease_all <- rbind(disease_all, disease_2020)
+
+# Load shape file for Milwaukee County (ON HOLD - want to map stroke prevalence rates to show geographic properties)
+#places_2020 <- read_csv(paste0(wd,"PLACES__Census_Tract_Data__GIS_Friendly_Format___2020_release.csv"))
+WI_shp <- st_read(paste0(wd,"WI_State_Census_Tracts/tl_2018_55_tract.shp"))
+WI_shp <- left_join(WI_shp, places_2020, by=c('GEOID'='TractFIPS'))
+WI_shp <- WI_shp %>% filter(TotalPopulation > 0)
+disease <- WI_shp$STROKE_CrudePrev
+bins <-  seq(min(disease, na.rm = T), max(disease, na.rm = T), length.out = 10) 
+pal <- colorBin("YlOrRd", domain = disease, bins = bins)
+map2020 <- leaflet(WI_shp)  %>% addTiles() %>% addPolygons(fillColor = ~pal(disease), fillOpacity = 0.6, weight=1, color="white")
+map2020
+
+# Save final PLACES file for faster knitting
+write_csv(disease_all, paste0(wd,"Compiled PLACES data.csv"))
+```
+
+```{r pre_load, echo=FALSE, include=FALSE}
+# Load pre-saved file for faster knitting
+disease_all <- read_csv(paste0(wd, "Compiled PLACES data.csv"))
+```
+
+Stroke is a cardiovascular disease that affects blood flow to the brain. A stroke occurs when a blood clot or blood vessel rupture obstructs the flow of blood to the brain. When the brain cannot get enough blood (and therefore oxygen) parts of the brain become damaged or die. Stroke is the 5th leading cause of death and a major cause of disability in the United States.
+
+Improving stroke outcomes begins with pre-hospital care. In the field, emergency medical services (EMS) professionals, such as paramedics and emergency technicians, collect valuable clinical information about stroke symptoms and when they started prior to emergency department arrival, ensure patients are transported to a stroke-receiving hospital or certified stroke center as quickly as possible, and pre-alert hospital-based stroke teams of an arriving patient needing stroke evaluation and care.
+
+In addition to acute care, EMS agencies are working to mitigate non-life threatening issues before they become an emergency though community [mobile integrated health](https://westalliswi.gov/1809/Mobile-Integrated-Healthcare) programs. Understanding where the greatest disease burden exists within a community and which community-level risk factors are present can help direct limited-resources to where they are needed most.
+
+This study aims to explore the degree to which neighborhood-level [social determinants of health (SDOH)](https://health.gov/healthypeople/priority-areas/social-determinants-health) can help predict crude prevalence of stroke by census tract. Examples of SDOH examined in this analysis include: employment, household income, educational attainment, language barriers, proximity to healthcare, access to health insurance, housing affordability, and transportation. Additional covariates include prevalence of related disease processes (e.g., hypertension, diabetes, etc.) and health risk behavior indicators (e.g., smoking, exercise, etc.).
+
+A census tract-level health data set was created by pooling data from the [500 Cities Project](https://www.cdc.gov/places/about/500-cities-2016-2019/index.html), the [PLACES: Local Data for Public Health](https://www.cdc.gov/places/index.html) project, and the [Social Determinants of Health Database](https://www.ahrq.gov/sdoh/data-analytics/sdoh-data.html). The final data set includes `r n_distinct(disease_all$YEAR)` years of data for `r n_distinct(disease_all$TractFIPS)` census tracts in Wisconsin[^1]. The median crude prevalence of ever being diagnosed with stroke by a physician among census tract residents who are 18 years or older was `r median(disease_all$STROKE_CrudePrev)`% (range: `r min(disease_all$STROKE_CrudePrev)`%-`r max(disease_all$STROKE_CrudePrev)`%).
+
+[^1]: \*Note: The original 500 Cities Project included data for the following Wisconsin cities: Milwaukee, Madison, Green Bay, Kenosha, Racine, Appleton, and Waukesha. The PLACES project (which replaced the 500 Cities Project in 2020) includes data for all census tracts in Wisconsin. For consistency, this analysis was restricted to the census tracts used in the 500 Cities Project.
+
+```{r transform, echo=FALSE, include=FALSE}
+# Create list of variables for inclusion in analytic data set
+var_include <- c('POS_DIST_ED_TRACT', 'POS_DIST_CLINIC_TRACT', 'ACS_PCT_MEDICAID_ANY_BELOW64', 'ACS_PCT_UNINSURED_BELOW64', 'ACCESS2_CrudePrev', 'ACS_PCT_IN_COUNTY_MOVE', 'ACS_PCT_IN_STATE_MOVE', 'ACS_PCT_DIF_STATE', 'ACS_PCT_VACANT_HU', 'CEN_POPDENSITY_TRACT', 'ACS_PER_CAPITA_INC', 'ACS_GINI_INDEX', 'ACS_PCT_HH_LIMIT_ENGLISH', 'ACS_MEDIAN_AGE', 'ACS_PCT_AGE_0_17', 'ACS_PCT_AGE_ABOVE65', 'ACS_PCT_AIAN', 'ACS_PCT_ASIAN', 'ACS_PCT_BLACK', 'ACS_PCT_HISPANIC', 'ACS_PCT_NHPI', 'ACS_PCT_WHITE', 'ACS_PCT_FEMALE', 'ACS_PCT_DISABLE', 'ACS_PCT_NON_CITIZEN', 'ACS_PCT_HU_BUILT_1979', 'ACS_PCT_HU_NO_FUEL', 'ACS_PCT_HU_KITCHEN', 'ACS_PCT_HU_PLUMBING', 'ACS_PCT_HU_NO_VEH', 'ACS_PCT_HS_GRADUATE', 'ACS_PCT_LT_HS', 'ACS_PCT_POSTHS_ED', 'ACS_PCT_UNEMPLOY', 'ACS_PCT_NOT_LABOR', 'ACS_PCT_COMMT_59MIN', 'ACS_PCT_COMMT_60MINUP', 'ACS_PCT_PUBL_TRANSIT', 'WUSTL_AVG_PM25', 'MHLTH_CrudePrev', 'PHLTH_CrudePrev', 'BINGE_CrudePrev', 'CSMOKING_CrudePrev', 'LPA_CrudePrev', 'SLEEP_CrudePrev', 'ACS_AVG_HH_SIZE', 'ACS_MEDIAN_HOME_VALUE', 'ACS_MEDIAN_RENT', 'ACS_MDN_OWNER_COST_MORTGAGE', 'ACS_MDN_OWNER_COST_NO_MORTG', 'ACS_PCT_OWNER_HU', 'ACS_PCT_OWNER_HU_COST_30PCT', 'ACS_PCT_RENTER_HU_COST_30PCT', 'ACS_PCT_RENTER_HU', 'ACS_PCT_1UP_PERS_1ROOM', 'ACS_MEDIAN_HH_INC', 'ACS_PCT_HH_INC_10000', 'ACS_PCT_HH_INC_14999', 'ACS_PCT_HH_INC_24999', 'ACS_PCT_NONVET_POV_18_64', 'ACS_PCT_HH_FOOD_STMP', 'ACS_PCT_HH_PUB_ASSIST', 'BPMED_CrudePrev', 'PAPTEST_CrudePrev', 'CHECKUP_CrudePrev', 'CHOLSCREEN_CrudePrev', 'COLON_SCREEN_CrudePrev', 'COREM_CrudePrev', 'COREW_CrudePrev', 'DENTAL_CrudePrev', 'MAMMOUSE_CrudePrev', 'ARTHRITIS_CrudePrev', 'BPHIGH_CrudePrev', 'CANCER_CrudePrev', 'CASTHMA_CrudePrev', 'CHD_CrudePrev', 'COPD_CrudePrev', 'DEPRESSION_CrudePrev', 'DIABETES_CrudePrev', 'HIGHCHOL_CrudePrev', 'KIDNEY_CrudePrev', 'OBESITY_CrudePrev')
+
+# Create analytic data set for stroke
+stroke <- disease_all %>% dplyr::select(Year, TractFIPS, population_count, STROKE_CrudePrev, any_of(var_include)) %>%
+  filter(!(Year == 2020	& TractFIPS == 55079050102) &  # remove census tracts with population = 0
+         !(Year == 2020	& TractFIPS == 55079160100) &
+         !(Year == 2020	& TractFIPS == 55079160204) &
+         !(Year == 2020	& TractFIPS == 55079160300)) %>%
+  mutate(ACS_PCT_HH_INC_25000 = ACS_PCT_HH_INC_10000 + ACS_PCT_HH_INC_14999 + ACS_PCT_HH_INC_24999,
+         Below_Median_HH_Inc = ifelse(ACS_MEDIAN_HH_INC < median(ACS_MEDIAN_HH_INC, na.rm=TRUE), "Y", "N"),
+         ACS_PCT_AANHPI = ACS_PCT_ASIAN + ACS_PCT_NHPI,
+         ACS_PCT_MOVED = ACS_PCT_IN_COUNTY_MOVE + ACS_PCT_IN_STATE_MOVE + ACS_PCT_DIF_STATE,
+         ACS_PCT_CMMT_30MINUP = ACS_PCT_COMMT_59MIN + ACS_PCT_COMMT_60MINUP,
+         #Year = as.factor(Year),
+         row_NA = apply(., 1, count_na_func)) %>%
+  dplyr::select(-ACS_PCT_HH_INC_10000, -ACS_PCT_HH_INC_14999, -ACS_PCT_HH_INC_24999, -ACS_PCT_ASIAN, -ACS_PCT_NHPI,
+                -ACS_PCT_IN_COUNTY_MOVE, -ACS_PCT_IN_STATE_MOVE, -ACS_PCT_DIF_STATE, -ACS_PCT_COMMT_59MIN, -ACS_PCT_COMMT_60MINUP)
+
+n <- dim(stroke)[1]
+
+# Summarize missing data
+nmiss <- colSums(is.na(stroke))
+
+stroke_miss <- stroke %>% summarize(ACS_MEDIAN_RENT = round(sum(is.na(stroke$ACS_MEDIAN_RENT))/n*100, 1),
+                                    ACS_MEDIAN_HH_INC = round(sum(is.na(stroke$ACS_MEDIAN_HH_INC))/n*100, 1),
+                                    ACS_MEDIAN_HOME_VALUE = round(sum(is.na(stroke$ACS_MEDIAN_HOME_VALUE))/n*100, 1),
+                                    ACS_MDN_OWNER_COST_MORTGAGE = round(sum(is.na(stroke$ACS_MDN_OWNER_COST_MORTGAGE))/n*100, 1),
+                                    ACS_MDN_OWNER_COST_NO_MORTG = round(sum(is.na(stroke$ACS_MDN_OWNER_COST_NO_MORTG))/n*100, 1),
+                                    ACS_PCT_OWNER_HU_COST_30PCT = round(sum(is.na(stroke$ACS_PCT_OWNER_HU_COST_30PCT))/n*100, 1),
+                                    ACS_PCT_HS_GRADUATE = round(sum(is.na(stroke$ACS_PCT_HS_GRADUATE))/n*100, 1),
+                                    ACS_PCT_LT_HS = round(sum(is.na(stroke$ACS_PCT_LT_HS))/n*100, 1),
+                                    ACS_PCT_POSTHS_ED = round(sum(is.na(stroke$ACS_PCT_POSTHS_ED))/n*100, 1),
+                                    COREW_CrudePrev = round(sum(is.na(stroke$COREW_CrudePrev))/n*100, 1),
+                                    MAMMOUSE_CrudePrev = round(sum(is.na(stroke$MAMMOUSE_CrudePrev))/n*100, 1))
+
+# Use custom function to impute median for missing values
+stroke$ACS_MEDIAN_RENT <- median_impute(stroke, stroke$ACS_MEDIAN_RENT)
+stroke$ACS_MEDIAN_HH_INC <- median_impute(stroke, stroke$ACS_MEDIAN_HH_INC)
+stroke$ACS_MEDIAN_HOME_VALUE <- median_impute(stroke, stroke$ACS_MEDIAN_HOME_VALUE)
+stroke$ACS_MDN_OWNER_COST_MORTGAGE <- median_impute(stroke, stroke$ACS_MDN_OWNER_COST_MORTGAGE)
+stroke$ACS_MDN_OWNER_COST_NO_MORTG <- median_impute(stroke, stroke$ACS_MDN_OWNER_COST_NO_MORTG)
+stroke$ACS_PCT_OWNER_HU_COST_30PCT <- median_impute(stroke, stroke$ACS_PCT_OWNER_HU_COST_30PCT)
+stroke$ACS_PCT_HS_GRADUATE <- median_impute(stroke, stroke$ACS_PCT_HS_GRADUATE)
+stroke$ACS_PCT_LT_HS <- median_impute(stroke, stroke$ACS_PCT_LT_HS)
+stroke$ACS_PCT_POSTHS_ED <- median_impute(stroke, stroke$ACS_PCT_POSTHS_ED)
+stroke$COREW_CrudePrev <- median_impute(stroke, stroke$COREW_CrudePrev)
+stroke$MAMMOUSE_CrudePrev <- median_impute(stroke, stroke$MAMMOUSE_CrudePrev)
+
+# Initialize new data set for applying transformations
+stroke_T <- stroke
+
+# Apply square root transformation to response variable (Stroke crude prevalence)
+stroke_T$STROKE_CrudePrev <- sqrt(stroke_T$STROKE_CrudePrev)
+
+# Use Box Cox method to recommend variable transformations (recommendations stored in new data frame)
+### Resource: https://www.r-bloggers.com/2022/10/box-cox-transformation-in-r/
+n = ncol(stroke_T)
+boxcox <- data.frame(matrix(ncol=3, nrow=n))
+colnames(boxcox) <- c('variable', 'lambda', 'recommended')
+for (ii in 5:n-1) {
+  x = as_vector(stroke_T[ii+1])
+  boxcox$variable[ii+1] = colnames(stroke_T[ii+1])
+  b <- boxcox(lm(stroke_T$STROKE_CrudePrev ~ x), plotit = FALSE)
+  boxcox$lambda[ii+1] <- round(b$x[which.max(b$y)],4)
+  boxcox$recommended[ii+1] <- case_when(boxcox$lambda[ii+1] > -.25 & boxcox$lambda[ii+1] < .25 ~ 'log(x)',
+                                        boxcox$lambda[ii+1] <= -.25 & boxcox$lambda[ii+1] > -.75 ~ '1/sqrt(x)',
+                                        boxcox$lambda[ii+1] >= .25 & boxcox$lambda[ii+1] < .75 ~ 'sqrt(x)',
+                                        boxcox$lambda[ii+1] >= .75 & boxcox$lambda[ii+1] < 1.5 ~ 'none',
+                                        TRUE ~ 'not classified')}
+boxcox <- boxcox %>% filter(!is.na(variable), variable != 'row_NA', variable != 'Below_Median_HH_Inc')
+
+# Use custom function to apply transformation recommended by Box Cox method to predictor variables
+stroke_T <- boxcox_apply(stroke_T, boxcox)
+```
+
+All variables in the final data set are numeric with no more than `r max(stroke_miss)`% of the data is missing on any given variable. Median imputation by census tract was applied to address missing values. The Box-Cox method was used to recommend reasonable transformations for heavily skewed variables (see Figure 1, Table 1). A small number of variables were combined to create new, more meaningful variables (e.g., variables for the percent of households with an income of \$0-\$10,000, \$10,001-\$14,999, and \$15,000-\$24,999 were collapsed to create one variable for the percent of households with income below \$25,000).
+
+### Figure 1. Square root transformation of the response variable (STROKE_CrudePrev)
+
+```{r graph1, echo=FALSE, fig.height=2.75, fig.align = "center"}
+par(mfrow=c(1,2), cex=0.9)
+hist(stroke$STROKE_CrudePrev, main="Untransformed \nSTROKE_CrudePrev", cex.main = 0.8, xlab="", col=alpha("#404080",.5))
+hist(stroke_T$STROKE_CrudePrev, main="Square root transformed \nSTROKE_CrudePrev", cex.main = 0.8, xlab="", col=alpha("#404080",.5))
+```
+
+### Table 1. Boxcox recommended transformations (sample)
+
+```{r table1, echo=FALSE, fig.align="center"}
+kable(boxcox[12:16,], col.names = c("Variable", "Lambda", "Recommended transformation"), booktabs=TRUE) %>% kable_styling(latex_options = c("striped", "hold_position")) 
+```
+
+```{r EDS, echo=FALSE, include=FALSE}
+# Create variable groupings (used in ggpairings)
+demographics <- c('ACS_MEDIAN_AGE', 'ACS_PCT_AGE_0_17', 'ACS_PCT_AGE_ABOVE65', 'ACS_PCT_FEMALE', 'ACS_PCT_AIAN', 'ACS_PCT_BLACK', 'ACS_PCT_HISPANIC', 'ACS_PCT_AANHPI', 'ACS_PCT_WHITE', 'ACS_PCT_DISABLE', 'ACS_PCT_NON_CITIZEN', 'ACS_PCT_HH_LIMIT_ENGLISH')
+educational_attainment <- c('ACS_PCT_HS_GRADUATE', 'ACS_PCT_LT_HS', 'ACS_PCT_POSTHS_ED')
+housing <- c('ACS_AVG_HH_SIZE', 'ACS_MEDIAN_HOME_VALUE', 'ACS_MEDIAN_RENT', 'ACS_MDN_OWNER_COST_MORTGAGE', 'ACS_MDN_OWNER_COST_NO_MORTG', 'ACS_PCT_OWNER_HU', 'ACS_PCT_OWNER_HU_COST_30PCT', 'ACS_PCT_RENTER_HU_COST_30PCT', 'ACS_PCT_RENTER_HU', 'ACS_PCT_1UP_PERS_1ROOM')
+economics <- c('ACS_PCT_UNEMPLOY', 'ACS_PCT_NOT_LABOR', 'ACS_PCT_CMMT_30MINUP', 'ACS_PCT_PUBL_TRANSIT', 'ACS_MEDIAN_HH_INC', 'ACS_PCT_HH_INC_25000', 'ACS_PER_CAPITA_INC', 'ACS_PCT_NONVET_POV_18_64', 'ACS_PCT_HH_FOOD_STMP', 'ACS_PCT_HH_PUB_ASSIST', 'ACS_GINI_INDEX')
+community_stability <- c('ACS_PCT_MOVED', 'ACS_PCT_VACANT_HU', 'CEN_POPDENSITY_TRACT')
+environment <- c('WUSTL_AVG_PM25')
+access_to_healthcare <- c('POS_DIST_TRAUMA_TRACT', 'POS_DIST_ED_TRACT', 'POS_DIST_CLINIC_TRACT', 'ACS_PCT_MEDICAID_ANY_BELOW64', 'ACS_PCT_UNINSURED_BELOW64', 'ACCESS2_CrudePrev')
+general_health_status <- c('MHLTH_CrudePrev', 'PHLTH_CrudePrev')
+health_risk_behaviors <- c('BINGE_CrudePrev', 'CSMOKING_CrudePrev', 'LPA_CrudePrev', 'SLEEP_CrudePrev', 'OBESITY_CrudePrev')
+preventive_healthcare <- c('BPMED_CrudePrev', 'PAPTEST_CrudePrev', 'CHECKUP_CrudePrev', 'CHOLSCREEN_CrudePrev',  'COLON_SCREEN_CrudePrev', 'COREM_CrudePrev', 'COREW_CrudePrev', 'DENTAL_CrudePrev', 'MAMMOUSE_CrudePrev')
+disease_prev <- c('BPHIGH_CrudePrev', 'CANCER_CrudePrev', 'CASTHMA_CrudePrev', 'CHD_CrudePrev', 'COPD_CrudePrev',  'ARTHRITIS_CrudePrev', 'DEPRESSION_CrudePrev', 'DIABETES_CrudePrev', 'HIGHCHOL_CrudePrev', 'KIDNEY_CrudePrev')
+deprivation <- c('ACS_PCT_HU_BUILT_1979', 'ACS_PCT_HU_NO_FUEL', 'ACS_PCT_HU_KITCHEN', 'ACS_PCT_HU_PLUMBING', 'ACS_PCT_HU_NO_VEH')
+
+# Apply custom function to create ggpair plots (NOTE: this was done before and after transformation)
+demo1 <- ggpair_plot(stroke_T, 'STROKE_CrudePrev', demographics[1:4], "Demographics 1")
+demo2 <- ggpair_plot(stroke_T, 'STROKE_CrudePrev', demographics[5:9], "Demographics 2")
+demo3 <- ggpair_plot(stroke_T, 'STROKE_CrudePrev', demographics[10:12], "Demographics 3")
+educ <- ggpair_plot(stroke_T, 'STROKE_CrudePrev', educational_attainment, "Educational attainment")
+house1 <- ggpair_plot(stroke_T, 'STROKE_CrudePrev', housing[1:5], "Housing 1")
+house2 <- ggpair_plot(stroke_T, 'STROKE_CrudePrev', housing[6:10], "Housing 2")  # drop ACT_PCT_OWNER_HU
+econ1 <- ggpair_plot(stroke_T, 'STROKE_CrudePrev', economics[1:6], "Economics 1")
+econ2 <- ggpair_plot(stroke_T, 'STROKE_CrudePrev', economics[7:11], "Economics 2")  # drop ACS_PCT_PUB_ASSIST
+stability <- ggpair_plot(stroke_T, 'STROKE_CrudePrev', community_stability, "Community stability")
+envi <- ggpair_plot(stroke_T, 'STROKE_CrudePrev', environment, "Environment")
+access <- ggpair_plot(stroke_T, 'STROKE_CrudePrev', access_to_healthcare, "Access to health care")
+health <- ggpair_plot(stroke_T, 'STROKE_CrudePrev', general_health_status, "General health status")
+riskbx <- ggpair_plot(stroke_T, 'STROKE_CrudePrev', health_risk_behaviors, "Health risk behaviors (post-transformation)")
+prevent1 <- ggpair_plot(stroke_T, 'STROKE_CrudePrev', preventive_healthcare[1:5], "Preventive health care 1")
+prevent2 <- ggpair_plot(stroke_T, 'STROKE_CrudePrev', preventive_healthcare[6:9], "Preventive health care 2")
+disease1 <- ggpair_plot(stroke_T, 'STROKE_CrudePrev', disease_prev[1:5], "Disease prevalence 1")
+disease2 <- ggpair_plot(stroke_T, 'STROKE_CrudePrev', disease_prev[5:10], "Disease prevalence 2")
+deprive <- ggpair_plot(stroke_T, 'STROKE_CrudePrev', deprivation, "Deprivation")
+
+# Correlation matrix for untransformed variables
+corr_matrix <- stroke_T %>% dplyr::select(-c(TractFIPS, population_count, row_NA, Below_Median_HH_Inc)) %>% ggcorr(nbreaks = 7, size = 1, hjust = 1) + theme_minimal() + ggtitle("")
+```
+
+```{r final_data, echo=FALSE, include=FALSE}
+# Final predictor selection
+stroke_T <- stroke_T %>% dplyr::select(-c(TractFIPS, population_count, row_NA, Below_Median_HH_Inc, any_of(disease_prev), ACS_PCT_OWNER_HU, ACS_PCT_HH_PUB_ASSIST)) 
+```
+
+### Figure 2. GGpairs plot of stroke crude prevalence versus select demographic predictor variables
+
+```{r graph2, echo=FALSE, fig.height=4.75, fig.align = "center"}
+riskbx
+```
+
+During exploratory analysis, relationships between predictor variables and the response variable were visually examined. A sample plot is shown in Figure 2 (above). A correlation matrix (Figure 3) shows a substantial amount of multicollinearity in the data set. Given the high dimensionality and multicollinearity of the data, the selected modeling methods for this analysis are LASSO regression and principal components analysis (PCA) with linear regression. Both methods are appropriate for handling multicollinearity and reducing dimensionality.
+
+### Figure 3. Correlation matrix for stroke crude prevalence and predictor variables
+
+```{r graph3, echo=FALSE, fig.height=3.75, fig.align = "center"}
+corr_matrix
+```
+
+```{r PCA, echo=FALSE, include=FALSE}
+################################################################################
+# 4.	Apply the unsupervised learning technique to your full data set.  Use graphs and tables 
+# to explore and interpret the results.  Adjust parameters (such as k for clustering or the 
+# minimum support for association rules) as needed to obtain informative, insightful interpretations.  
+################################################################################
+
+# Apply custom function to perform PCA on key domains
+sdoh_groups <- c(housing, economics, community_stability, deprivation)
+sdoh_pca = pca_func(stroke_T, "sdoh", sdoh_groups)
+
+health_groups <- c(access_to_healthcare, general_health_status, preventive_healthcare, health_risk_behaviors)
+health_pca = pca_func(stroke_T, "health", health_groups)
+
+# Create data frame for stroke_PCA data 
+stroke_PCA = stroke_T %>% dplyr::select(-c(any_of(sdoh_groups), any_of(health_groups))) %>% cbind(sdoh_pca[[2]]) %>% cbind(health_pca[[2]])
+
+# Examine PC loadings
+PCAloading_plot(sdoh_pca[[1]]$rotation, 1, .25)  # Poverty
+PCAloading_plot(sdoh_pca[[1]]$rotation, 2, .25)  # Neighborhood stability
+PCAloading_plot(sdoh_pca[[1]]$rotation, 3, .25)  # Deprivation
+PCAloading_plot(sdoh_pca[[1]]$rotation, 4, .25)  # Neighborhood crowding
+PCAloading_plot(sdoh_pca[[1]]$rotation, 5, .25)  # Household size
+PCAloading_plot(sdoh_pca[[1]]$rotation, 6, .25)  # Suburbs?
+PCAloading_plot(sdoh_pca[[1]]$rotation, 7, .25)  # Poor housing quality
+PCAloading_plot(sdoh_pca[[1]]$rotation, 8, .25)
+PCAloading_plot(sdoh_pca[[1]]$rotation, 9, .25)  # Higher home ownership?
+
+PCAloading_plot(health_pca[[1]]$rotation, 1, .25)  # Health screenings
+PCAloading_plot(health_pca[[1]]$rotation, 2, .25)  # Preventive health care
+PCAloading_plot(health_pca[[1]]$rotation, 3, .25)  # Access to healthcare
+
+# Sample plots
+plot(sdoh_pca[[3]], type = "o", ylab="Cumulative PVE", xlab="Principal Component")
+biplot(sdoh_pca[[1]], choices=1:2, scale=0)
+corr_matrix_pca <- ggcorr(stroke_PCA, size = 1, hjust = 1) + theme_minimal()
+
+# Dimension reduction
+dim(stroke_T)
+dim(stroke_PCA)
+```
+
+Prior to model fitting, principal components analysis was performed on two key domains using the full data set. The first domain includes variables related to social determinants of health, such as housing, economics, community stability, and deprivation. The second domain includes health related topics, such as access to healthcare, general health status, preventive healthcare, and health risk behaviors. Demographic and environmental variables were not included in the PCA analysis. Using a threshold of 0.8 for the cumulative proportion of variance explained, `r sdoh_pca[[4]]` components were retained for social determinants of health and `r health_pca[[4]]` components were retained for health (Figure 4).
+
+### Figure 4. Cumulative proportion of variance explained
+
+```{r graph4, echo=FALSE, fig.height=2.75, fig.align = "center"}
+par(mfrow=c(1,2), cex=0.9)
+plot(sdoh_pca[[3]], type = "o", main="SDOH principal components", cex.main = 0.8, ylab="Cumulative PVE", xlab="Principal Component", col="#404080"); abline(v=sdoh_pca[[4]], col="#69b3a2")
+plot(health_pca[[3]], type = "o", main="Health principal components", cex.main = 0.8, ylab="Cumulative PVE", xlab="Principal Component", col="#404080"); abline(v=health_pca[[4]], col="#69b3a2")
+```
+
+Loading values were examined to provide an interpretation for each principal component. Meaningful interpretations were found for most principal components. Social determinant of health PC1 (Figure 5) loaded positively onto percent of households receiving food stamps and percent of households with less than \$25,000 in income while loading negatively onto median household income, income per capita, and median home value. This principal component is interpreted as a measure of poverty. Health PC2 (Figure 6) had strong positive loadings for routine health checkups, receiving a cholesterol screening, and taking medicine for high blood pressure. This principal component is interpreted as a measure of preventive health care.
+
+### Figure 5. Principal component loadings for SDOH PC1
+
+```{r graph5, echo=FALSE, fig.height=3.8, fig.align = "center"}
+PCAloading_plot(sdoh_pca[[1]]$rotation, 1, .25) 
+```
+
+### Figure 6. Principal component loadings for Health PC2
+
+```{r graph6, echo=FALSE, fig.height=3.5, fig.align = "center"}
+PCAloading_plot(health_pca[[1]]$rotation, 2, .25)
+```
+
+After applying PCA, the dimensionality of the data set was reduced from `r dim(stroke_T)[2]-1` predictors to `r dim(stroke_PCA)[2]-1` predictors. PCA also resolved the impediment of multicollinearity, making the final data set suitable for linear regression. The trade off between parsimony and interpretability inherent to PCA may be worthwhile if it produces a superior model for predicting stroke crude prevalence; however, it will likely reduce interpretability of the model and ability to make specific recommendations to reduce stroke incidence.
+
+```{r singleCV, echo=FALSE, include=FALSE}
+################################################################################
+# 1.	Conduct a single layer of validation on both of the supervised learning techniques.   
+# Tune at least one parameter for at least one of the modeling types.  
+################################################################################
+
+# Set up model training method (10-fold cross-validation)
+dataused = stroke_T
+
+ctrl = trainControl(method = "cv", number = 10)
+
+lambdalist = c((1:35)/100)
+
+model_lasso = train(STROKE_CrudePrev ~ .,
+                  data = dataused,
+                  method = "glmnet",
+                  trControl = ctrl,
+                  tuneGrid = expand.grid(alpha = 1, lambda = lambdalist))
+
+lasso_min_rmse = round(min(model_lasso$results$RMSE),3)
+lasso_coeffs = round(coef(model_lasso$finalModel, model_lasso$bestTune$lambda),4)
+plot(model_lasso$results$RMSE)
+
+# Set up model training method (10-fold cross-validation)
+dataused = stroke_PCA %>% dplyr::select(-c(ACS_PCT_LT_HS, ACS_PCT_POSTHS_ED, ACS_PCT_AGE_ABOVE65, ACS_PCT_AGE_0_17, ACS_PCT_WHITE)) 
+
+ctrl = trainControl(method = "cv", number = 10)
+
+model_pca = train(STROKE_CrudePrev ~ .,
+                    data = dataused,
+                    method = "lm",
+                    trControl = ctrl)
+
+summary(model_pca)
+PCA_min_rmse = round(min(model_pca$results$RMSE),3)
+```
+
+A single layer of 10-fold cross-validation was used to fit the LASSO regression and PCA linear regression models. A tuning parameter, lambda, was used to fit the LASSO model. The cross-validation RMSE plotted against different values of lambda is displayed below (Figure 7). A lambda value of `r model_lasso$bestTune$lambda` was found to be optimal. Single cross-validation preferred the LASSO regression (RMSE = `r lasso_min_rmse`) over the PCA linear regression (RMSE = `r PCA_min_rmse`) as the better model.
+
+### Figure 7. LASSO regression: RMSE for different values of lambda
+
+```{r graph7, echo=FALSE, fig.height=3, fig.align = "center"}
+par(mfrow=c(1,1), cex=0.9)
+plot(model_lasso, col="#404080", cex.lab=1)
+#abline(v=.01, col="#69b3a2")
+```
+
+```{r doubleCV, echo=FALSE, include=FALSE}
+################################################################################
+# 2. Conduct an outer layer of validation, containing both of the modeling types.  
+# Modify your code from the single layer of validation to use traindata.out rather 
+# than the full data set.  Assess the performance of your model selection process.
+################################################################################
+
+set.seed(740)
+
+# Define variable groups for PCA analysis
+sdoh_groups <- c(housing, economics, community_stability, deprivation)
+health_groups <- c(access_to_healthcare, general_health_status, preventive_healthcare, health_risk_behaviors)
+
+# Define cross-validation splits
+kfolds = 5
+n = dim(stroke_T)[1]
+groups = rep(1:kfolds, length=n)  # create sets of group labels
+cvgroups = sample(groups, n)  # randomly order the groups
+
+# Create storage for model assessment
+allpredCV = rep(NA, n)  # storage for predicted values from validation set for each outer fold
+m1predCV = rep(NA, n)
+m2predCV = rep(NA, n)
+ycompare = rep(NA, n)
+all_best_hparam = vector("list", kfolds)  # storage for best model hyperparameter
+best_table = rep(NA, kfolds)
+
+### CREATE OUTER LOOPS FOR MODEL ASSESSMENT ###
+for(jj in 1:kfolds) {
+  groupjj = (cvgroups == jj)  # select fold group
+  stroke_train = stroke_T[!groupjj,]  # create training set for current fold
+  stroke_test = stroke_T[groupjj,]  # create validation set for current fold
+  
+  ### CREATE INNER CROSS VALIDATION FOR MODEL SELECTION ###
+  # Perform PCA on training and test data
+  sdoh_pca_train = pca_func(stroke_train, "sdoh", sdoh_groups)
+  health_pca_train = pca_func(stroke_train, "health", health_groups)
+  
+  # Specify training data sets
+  dataused_LASSO = stroke_train
+  dataused_PCA = stroke_train %>% 
+    dplyr::select(-c(ACS_PCT_LT_HS, ACS_PCT_POSTHS_ED, ACS_PCT_AGE_ABOVE65, ACS_PCT_AGE_0_17, ACS_PCT_WHITE)) %>% 
+    dplyr::select(-c(any_of(sdoh_groups), any_of(health_groups))) %>% 
+    cbind(sdoh_pca_train[[2]]) %>% cbind(health_pca_train[[2]])
+  
+  # Apply PCA to test data
+  sdoh_pca_test = predict(sdoh_pca_train[[1]], stroke_test)[,1:sdoh_pca_train[[4]]]
+  colnames(sdoh_pca_test) = paste0('sdoh_', colnames(sdoh_pca_test))
+  
+  health_pca_test = predict(health_pca_train[[1]], stroke_test)[,1:health_pca_train[[4]]]
+  colnames(health_pca_test) = paste0('health_', colnames(health_pca_test))
+  
+  stroke_test_pca = stroke_test %>% 
+    dplyr::select(-c(ACS_PCT_LT_HS, ACS_PCT_POSTHS_ED, ACS_PCT_AGE_ABOVE65, ACS_PCT_AGE_0_17, ACS_PCT_WHITE)) %>% 
+    dplyr::select(-c(any_of(sdoh_groups), any_of(health_groups))) %>% 
+    cbind(sdoh_pca_test) %>% cbind(health_pca_test)
+  
+  # Set up model training method (10-fold cross-validation)
+  ctrl = trainControl(method = "cv", number = 10)
+  
+  lambdalist = c((1:35)/100)
+  
+  model_lasso = train(STROKE_CrudePrev ~ .,
+                    data = dataused_LASSO,
+                    method = "glmnet",
+                    trControl = ctrl,
+                    tuneGrid = expand.grid(alpha = 1, lambda = lambdalist))
+  
+  model_pca = train(STROKE_CrudePrev ~ .,
+                    data = dataused_PCA,
+                    method = "lm",
+                    trControl = ctrl)
+
+  ### IDENTIFY SELECTED MODEL TO FIT TO FULL DATA ###
+  kfold_Hparam = list(model_lasso$bestTune$lambda, "N/A")
+  kfold_RMSE = c(model_lasso$results$RMSE[model_lasso$results$lambda == model_lasso$bestTune$lambda], 
+                 model_pca$results$RMSE)
+  kfold_R2 = c(model_lasso$results$Rsquared[model_lasso$results$lambda == model_lasso$bestTune$lambda], 
+               model_pca$results$Rsquared)
+  kfold_allbestmodels = (1:2)[kfold_RMSE == min(kfold_RMSE)]
+  kfold_bestmodel = ifelse(length(kfold_allbestmodels)==1, kfold_allbestmodels, sample(kfold_allbestmodels,1))
+  
+  best_table[jj] <- ifelse(kfold_bestmodel==1, paste0("Best model at outer loop ", jj, " is LASSO linear regression with lambda = ", kfold_Hparam[kfold_bestmodel], ", RMSE = ", round(kfold_RMSE[kfold_bestmodel],4), ", and R^2 = ", round(kfold_R2[kfold_bestmodel],2)), paste0("Best model at outer loop ", jj, " is PCA linear regression with RMSE = ", round(kfold_RMSE[kfold_bestmodel],3), " and R^2 = ", round(kfold_R2[kfold_bestmodel],2)))
+
+  ycompare[groupjj] = stroke_test$STROKE_CrudePrev  
+  m1predCV[groupjj] = predict(model_lasso, newdata=stroke_test, s=model_lasso$bestTune$lambda)
+  m2predCV[groupjj] = predict(model_pca, newdata=stroke_test_pca)
+  if (kfold_bestmodel == 1) allpredCV[groupjj] = m1predCV[groupjj]
+  if (kfold_bestmodel == 2) allpredCV[groupjj] = m2predCV[groupjj]
+}
+
+# Model assessment
+m1.assess.RMSE = sqrt(mean((m1predCV - ycompare)^2)); m1.assess.RMSE
+m2.assess.RMSE = sqrt(mean((m2predCV - ycompare)^2)); m2.assess.RMSE
+all.assess.RMSE = sqrt(mean((allpredCV - ycompare)^2)); all.assess.RMSE
+
+m1.assess.R2 = 1 - sum((m1predCV - ycompare)^2) / sum((ycompare - mean(ycompare))^2); m1.assess.R2
+m2.assess.R2 = 1 - sum((m2predCV - ycompare)^2) / sum((ycompare - mean(ycompare))^2); m2.assess.R2
+all.assess.R2 = 1 - sum((allpredCV - ycompare)^2) / sum((ycompare - mean(ycompare))^2); all.assess.R2
+
+m1.assess.MAE = mae_calc(ycompare, m1predCV)
+m2.assess.MAE = mae_calc(ycompare, m1predCV)
+all.assess.MAE = mae_calc(ycompare, m1predCV)
+
+# Best model
+final_LASSO_model_coef = round(coef(model_lasso$finalModel, s=model_lasso$bestTune$lambda),4)
+final_LASSO_model_sig = final_LASSO_model_coef[abs(final_LASSO_model_coef[,"s1"])>0,]
+final_LASSO_model_varImp = varImp(model_lasso, scale=FALSE)
+```
+
+Next, an outer layer of 5-fold cross-validation was conducted to assess the performance of the model selection process. The double cross-validation process consistently chose the LASSO regression as the best model (Table 2). This validates the results of the single cross-validation, which also preferred the LASSO regression over the PCA linear regression.
+
+```{r table2, echo=FALSE, fig.align="center"}
+kable(as_tibble(best_table), col.names = c("Table 2: Double cross-validation results table"), booktabs=TRUE) %>% kable_styling(latex_options = c("striped", "hold_position")) 
+```
+
+The honest double cross-validation model assessment shows an RMSE value of `r round(all.assess.RMSE,3)`. The prediction accuracy of the best model is unusually high. The mean absolute error for the best model indicates the predicted values are, on average, `r round(all.assess.MAE,3)` units away from the true stroke crude prevalence values.  A plot of actual y-values versus predicted y-values (Figure 8) shows a high level of predictive accuracy for census tracts with low to moderate crude prevalence of stroke.  Among census tracts with higher rates of stroke, the mean absolute error increases where the model tends to under-estimate stroke crude prevalence. To improve the fit of the model, it is recommended that more census tracts with high stroke crude prevalence rates be included to increase the number of observations training the model. Including additional years of data may certainly assist with this. It is also possible to include the full PLACES data set to increase the overall number of census tracts (see Footnote 1).
+
+### Figure 8. Predicted vs actual y-values for LASSO regression
+
+```{r graph8, echo=FALSE, fig.height=2.75, fig.align = "center"}
+as_tibble(cbind(ycompare, m1predCV)) %>% ggplot(aes(x=ycompare^2, y=m1predCV^2)) +
+  geom_point(color="#404080", fill="#404080", alpha=.5) +
+  labs(x="Actual stroke crude prevalence (untransformed)", y="Predicted stroke crude prevalence (untransformed)") +
+  xlim(0,10) +
+  ylim(0,10) +
+  geom_abline(intercept=0, slope=1, color ="#69b3a2") +
+  theme_minimal() +
+  theme(plot.title = element_text(size = 10), 
+        axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1, size=6), 
+        axis.text.y = element_text(size=6), 
+        axis.title.x=element_text(size=8),
+        axis.title.y=element_text(size=8),
+        legend.title=element_text(size=8),
+        legend.text=element_text(size=6))
+```
+
+```{r best_model, echo=FALSE, include=FALSE}
+################################################################################
+# 3.	Based on your results from steps 4a and/or 4b, select one “best” model (including 
+# its tuning parameter values).  Fit the model on the entire data set.  
+################################################################################
+
+# Fit LASSO model to full data set using glmnet package
+### NOTE: I used glmnet for this section to practice using the package and to see how close the results would be to caret
+x = model.matrix(STROKE_CrudePrev ~., data=stroke_T)[,-1]
+y = stroke_T$STROKE_CrudePrev
+model_final = glmnet(x, y, alpha=1)
+
+final_model_coef = round(coef(model_final, s=model_lasso$bestTune$lambda),4)
+final_model_sig = final_model_coef[abs(final_model_coef[,"s1"])>0,]; final_model_sig
+
+final_model_varImp = as_tibble(tibble::rownames_to_column(as.data.frame(final_model_sig[-1]), "Predictor")) %>%
+  rename("Importance" = "final_model_sig[-1]") %>%
+  mutate(Direction = ifelse(Importance > 0, "Positive", "Negative"), Importance = (abs(Importance))) %>% 
+  arrange(desc(Importance))
+
+plot(model_final, xvar="lambda", label = TRUE)  # plot pathway of best fit across diff lambdas
+```
+
+Finally, the best model (LASSO regression) was fit to the full data using the optimized control parameter (lambda=`r model_lasso$bestTune$lambda`). The LASSO model identified three predictor variables of greatest importance when predicting stroke crude prevalence (Figure 9): crude prevalence of blood pressure medication use, crude prevalence of binge drinking, and percent of adults who report 14 or more days during the past 30 days during which their physical health was not good. Use of blood pressure medication and reporting poor physical health were positively related to crude prevalence of stroke. Binge drinking was negatively associated with rates of stroke at the neighborhood level.
+
+### Figure 9. Variable importance for LASSO regression
+
+```{r graph9, echo=FALSE, fig.height=4, fig.align = "center"}
+final_model_varImp %>% ggplot(aes(x=reorder(Predictor, Importance), y=Importance, fill=Direction, color=Direction)) + 
+  geom_bar(stat="identity", alpha=.5) +
+  geom_text(label=round(final_model_varImp$Importance,4), size=2.5, hjust=-.2, color="black") +
+  labs(y="Importance", x="") +
+  ylim(0,1) +
+  theme_minimal() +
+  theme(plot.title = element_text(size = 10), 
+        axis.text.x = element_text(size=6), 
+        axis.text.y = element_text(size=6), 
+        axis.title.x=element_text(size=8),
+        axis.title.y=element_text(size=8),
+        legend.title=element_text(size=8),
+        legend.text=element_text(size=6)) +
+  scale_fill_manual(values=c("#69b3a2", "#404080")) +
+  scale_color_manual(values=c("#69b3a2", "#404080")) + 
+  coord_flip()
+```
+
+\newpage
+
+The predictors of greatest importance are both surprising and unsurprising. Higher prevalence of blood pressure medication usage indicates a higher prevalence of cardiovascular disease in a census tract. Cardiovascular disease is a significant risk factor for stroke. On an individual level, binge drinking is a known risk factor for stroke. However, in this analysis, higher prevalence of binge drinking was associated with lower prevalence of stroke. This may be explained by the lower prevalence of binge drinking in census tracts with incomes below the median. Household income and poverty are strongly associated with many adverse health outcomes, including stroke.
